@@ -10,3 +10,7 @@ deepul.egg-info/
 *.out
 *.synctex.gz
 *.pdf
+.ipynb_checkpoints
+.virtual_documents
+build
+lightning_logs
