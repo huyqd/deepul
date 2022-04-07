@@ -1,5 +1,4 @@
 import matplotlib.pyplot as plt
-import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
@@ -93,7 +92,7 @@ class ImageFlow(pl.LightningModule):
         return self.log_prob(x.float())
 
     def flow(self, x):
-        z, log_det = x.float(), torch.zeros(x.shape[0], device=self.device)
+        z, log_det = x.float(), torch.zeros_like(x)
         for flow_module in self.flows:
             z, log_det = flow_module(z, log_det)
         return z, log_det
@@ -105,17 +104,11 @@ class ImageFlow(pl.LightningModule):
 
     def log_prob(self, x):
         z, log_det = self.flow(x)
-        return (self.base_dist.log_prob(z) + log_det).sum(dim=1)
+        return self.base_dist.log_prob(z).sum(dim=1) + log_det.sum(dim=1)
 
     # Compute loss as negative log-likelihood
     def loss(self, x):
         return -self.log_prob(x).mean()
-
-    def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=self.lr)
-        # An scheduler is optional, but can help in flows to get the last bpd improvement
-        scheduler = optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.99)
-        return [optimizer], [scheduler]
 
     def training_step(self, batch, batch_idx):
         # Normalizing flows are trained by maximum likelihood => return bpd
@@ -126,6 +119,11 @@ class ImageFlow(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         loss = self.loss(batch)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(), lr=self.lr)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.99)
+        return [optimizer], [scheduler]
 
 
 def train_model(flows, train_loader, val_loader, train_args):
@@ -151,12 +149,6 @@ def train_model(flows, train_loader, val_loader, train_args):
     )
 
     trainer.fit(module, train_dataloaders=train_loader, val_dataloaders=val_loader)
-
-    if train_args.get("plot", True):
-        pd.DataFrame(
-            dict(train_loss=loss_tracker.train_loss, test_loss=loss_tracker.val_loss)
-        ).plot(title="Training Curve")
-        plt.show()
 
     return module, loss_tracker.train_loss, loss_tracker.val_loss
 
@@ -233,7 +225,7 @@ class ConditionalMixtureCDFFlow(nn.Module):
     def flow(self, x, cond, log_det):
         # set up mixture distribution
         loc, log_scale, weight_logits = torch.chunk(self.mlp(cond), 3, dim=1)
-        weights = F.softmax(weight_logits, dim=0)
+        weights = F.softmax(weight_logits, dim=1)
 
         mixture_dist = self.mixture_dist(loc, log_scale.exp())
 
@@ -282,5 +274,35 @@ class AutoregressiveFlow(nn.Module):
         z2, log_det_2 = self.dim2_flows(x2, x1, log_det)
         z = torch.hstack([z1.unsqueeze(1), z2.unsqueeze(1)])
         log_det = torch.hstack([log_det_1.unsqueeze(1), log_det_2.unsqueeze(1)])
+
+        return z, log_det
+
+
+class AffineFlow(nn.Module):
+    def __init__(
+            self,
+            side
+    ):
+        super().__init__()
+        if side == "left":
+            self.mask = torch.FloatTensor([1, 0])
+        elif side == "right":
+            self.mask = torch.FloatTensor([0, 1])
+        self.side = side
+        self.scale = nn.Parameter(torch.randn(1), requires_grad=True)
+        self.scale_shift = nn.Parameter(torch.randn(1), requires_grad=True)
+        self.mlp = MLP([2, 64, 64, 64, 2])
+
+    def forward(self, x, log_det):
+        return self.flow(x, log_det)
+
+    def flow(self, x, log_det):
+        g_scale, g_scale_shift = torch.chunk(self.mlp(x * self.mask), 2, dim=1)
+        log_scale = self.scale * F.tanh(g_scale) + self.scale_shift
+        log_scale = log_scale * (1 - self.mask)
+        g_scale_shift = g_scale_shift * (1 - self.mask)
+        z = torch.exp(log_scale) * x + g_scale_shift
+
+        log_det += log_scale
 
         return z, log_det
