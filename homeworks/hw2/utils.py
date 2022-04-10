@@ -306,3 +306,108 @@ class AffineFlow(nn.Module):
         log_det += log_scale
 
         return z, log_det
+
+
+class MaskConv2d(nn.Conv2d):
+    def __init__(self, mask_type, in_channels, out_channels, kernel_size, stride=1, padding=0,
+                 dilation=1, groups=1, bias=True, padding_mode="zeros"):
+        super().__init__(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias, padding_mode)
+
+        # self.weight.size() = (out_channels, in_channels, h, w)
+        self.register_buffer("mask", torch.zeros_like(self.weight))
+        self.create_mask(mask_type)
+
+    def forward(self, x):
+        # x.size() = (batch_size, in_channels, h, w)
+        # out.size() = (batch_size, out_channels, h, w)
+        out = F.conv2d(x, self.weight * self.mask, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+        return out
+
+    def create_mask(self, mask_type):
+        k = self.kernel_size[0]
+        self.mask[:, :, : k // 2] = 1
+        self.mask[:, :, k // 2, : k // 2] = 1
+
+        if mask_type == "B":
+            self.mask[:, :, k // 2, k // 2] = 1
+
+
+class PixelCNN(nn.Module):
+    def __init__(self, input_shape, n_components=5, n_filters=64, kernel_size=7, n_layers=5):
+        super().__init__()
+        assert n_layers >= 2
+
+        n_channels = input_shape[0]
+
+        layers = [MaskConv2d("A", n_channels, n_filters, kernel_size=kernel_size, padding=kernel_size // 2)]
+
+        for _ in range(n_layers):
+            layers.extend(
+                [
+                    nn.ReLU(),
+                    MaskConv2d("B", n_filters, n_filters, kernel_size=kernel_size, padding=kernel_size // 2),
+                ]
+            )
+
+        layers.extend(
+            [
+                nn.ReLU(),
+                MaskConv2d("B", n_filters, n_filters, kernel_size=1),
+                nn.ReLU(),
+                MaskConv2d("B", n_filters, n_components * 3, kernel_size=1),
+            ]
+        )
+
+        self.net = nn.ModuleList(layers)
+        self.input_shape = input_shape
+        self.n_channels = n_channels
+        self.n_components = n_components
+
+    def forward(self, x):
+        # x.size() = (batch_size, in_channels, h, w)
+        batch_size = x.shape[0]
+        out = (x.float() / (self.n_colors - 1) - 0.5) / 0.5
+        for layer in self.net:
+            out = layer(out)
+
+        out = out.view(batch_size, self.n_channels, self.n_components * 3, *self.input_shape[1:]).permute(0, 2, 1, 3, 4)
+
+        return out
+
+    @torch.no_grad()
+    def sample(self, n, cond):
+        samples = torch.zeros(n, *self.input_shape).cuda()
+        for r in range(self.input_shape[1]):
+            for c in range(self.input_shape[2]):
+                for k in range(self.n_channels):
+                    logits = self(samples, cond)[:, :, k, r, c]
+                    probs = F.softmax(logits, dim=1)
+                    samples[:, k, r, c] = torch.multinomial(probs, 1).squeeze(-1)
+        return samples.permute(0, 2, 3, 1).cpu().numpy()
+
+
+class AutoregressiveFlowPixelCNN(nn.Module):
+    def __init__(self, input_shape, n_components=5, n_filters=64, kernel_size=7, n_layers=5):
+        super().__init__()
+        self.net = PixelCNN(input_shape, n_components=5, n_filters=64, kernel_size=7, n_layers=5)
+
+    def forward(self, x, log_det=0):
+        return self.flow(x, log_det)
+
+    def flow(self, x, log_det):
+        # x.size() = (batch_size, in_channels, h, w)
+        loc, log_scale, weight_logits = torch.chunk(self.net(x), 3, dim=1)
+        weights = F.softmax(weight_logits, dim=1)
+
+        mixture_dist = self.mixture_dist(loc, log_scale.exp())
+
+        x_repeat = x.repeat(1, self.n_components)
+
+        # z = cdf of x
+        z = torch.clamp((mixture_dist.cdf(x_repeat) * weights).sum(dim=1), 0, 1 - 1e-5)
+
+        # log_det = log dz/dx = log pdf(x)
+        log_det += (mixture_dist.log_prob(x_repeat).exp() * weights).sum(dim=1).log()
+
+        return z, log_det
