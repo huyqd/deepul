@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from pytorch_lightning import Callback
-from pytorch_lightning.callbacks import ProgressBar
+from pytorch_lightning.callbacks import TQDMProgressBar
 from scipy.optimize import bisect
 from torch.distributions.beta import Beta
 from torch.distributions.normal import Normal
@@ -55,7 +55,7 @@ class PlotCallback(Callback):
             plt.show()
 
 
-class NotebookProgressBar(ProgressBar):
+class NotebookProgressBar(TQDMProgressBar):
     def init_validation_tqdm(self):
         bar = tqdm(disable=True)
 
@@ -140,7 +140,7 @@ def train_model(flows, train_loader, val_loader, train_args):
         max_epochs=train_args["epochs"],
         log_every_n_steps=1,
         check_val_every_n_epoch=1,
-        checkpoint_callback=False,
+        enable_checkpointing=False,
         num_sanity_val_steps=0,
         gradient_clip_val=1,
         gradient_clip_algorithm="norm",
